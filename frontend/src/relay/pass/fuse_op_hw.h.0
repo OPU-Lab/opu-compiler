@@ -1,0 +1,946 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+/*!
+ *
+ * \file src/tvm/relay/pass/fuse_ops.cc
+ *
+ * \brief This is a backend-aware optimization pass.
+ *   Fuse necessary ops into a single one.
+ */
+#include <tvm/expr_operator.h>
+#include <tvm/relay/analysis.h>
+#include <tvm/relay/expr_functor.h>
+#include <tvm/relay/op_attr_types.h>
+#include <tvm/relay/transform.h>
+#include <tvm/ir/attrs.h>
+#include "./pattern_util.h"
+#include "../../support/arena.h"
+#include "./hw_info.h"
+
+
+namespace tvm {
+namespace relay {
+using support::LinkNode;
+using support::LinkedList;
+class Attr{
+ public:
+   std::string type{""};
+   bool mapped{false};
+   Attr(std::string type){
+     this->type = type; 
+   };  
+   std::string mapped_name{""}; 
+   const Attrs* op_attr{nullptr};
+   Array<PrimExpr> shape;
+};
+
+class IndexedGraph {
+ public:
+  struct Node;
+  /*!
+   * The forward edge in the dataflow graph.
+   */
+  struct Edge {
+    /*! \brief The corresponding node */
+    Node* node{nullptr};
+    /*! \brief The respective pattern of this op */
+    OpPatternKind pattern{kOpaque};
+  };
+  /*! \brief A node in the graph. */
+  struct Node {
+    /*! \brief weak reference to the corresponding edge. */
+    const tvm::Object* ref{nullptr};
+    /*! \brief The index of the node in topological order. */
+    size_t index{0};
+    /*! \brief Whether this node is referenced by external source */
+    bool extern_ref{false};
+    /*! \brief The general pattern in the node */
+    OpPatternKind pattern{kOpaque};
+    /*! \brief The outputs of the node. */
+    LinkedList<Edge> outputs;
+    Attr* attr;
+    LinkedList<Edge> inputs;
+  };
+  /*! \brief The node map that maps node to graph */
+  std::unordered_map<const tvm::Object*, Node*> node_map;
+  /*! \brief All the nodes in post DFS order */
+  std::vector<Node*> post_dfs_order;
+
+  /*! \brief Dump the graph into string. */
+  void DebugDump() {
+    std::ostringstream os;
+    for (size_t i = 0; i < post_dfs_order.size(); ++i) {
+      Node* node = post_dfs_order[i];
+      os << "node[" << i << "], "
+         << GetRef<ObjectRef>(node->ref)
+         << " outputs=[";
+      for (auto* link = node->outputs.head; link != nullptr; link = link->next) {
+        os << link->value.node->index << ", ";
+      }
+      os << "]\n";
+    }
+    LOG(INFO) << os.str();
+  }
+  /*!
+   * \brief create a indexed forward graph.
+   * \param arena The arena used for data allocation.
+   * \param body The body of the expression to create a graph.
+   */
+  static IndexedGraph Create(support::Arena* arena, const Expr& body);
+
+ private:
+  class Creator;
+};
+
+class IndexedGraph::Creator : private ExprVisitor {
+ public:
+  explicit Creator(support::Arena* arena)
+      : arena_(arena) {}
+
+  IndexedGraph Prepare(const Expr& body) {
+    this->Update(body, nullptr, kOpaque);
+    this->VisitExpr(body);
+    //LOG(INFO) << os.str();
+    return std::move(graph_);
+  }
+
+ private:
+  std::ostringstream os;
+  /*! \brief allocator of all the internal node object */
+  support::Arena* arena_;
+  // The output.
+  IndexedGraph graph_;
+  // attribute equal comparator
+  AttrsEqual attr_equal_;
+  // Update the message stored at the node.
+  void Update(const Expr& node,
+              IndexedGraph::Node* parent,
+              OpPatternKind pattern) {
+    const tvm::Object* key = node.get();
+    IndexedGraph::Node* current;
+    auto it = graph_.node_map.find(key);
+    if (it != graph_.node_map.end()) {
+      current = it->second;
+    } else {
+      current = arena_->make<IndexedGraph::Node>();
+      graph_.node_map[key] = current;
+    }
+    if (parent != nullptr) {
+      auto* link = arena_->make<LinkNode<IndexedGraph::Edge> >();
+      link->value.node = parent;
+      link->value.pattern = pattern;
+      current->outputs.Push(link);
+    } else {
+      current->extern_ref = true;
+    }
+  }
+
+  void AddNode(const tvm::Object* key, Attr* attr) {
+    auto it = graph_.node_map.find(key);
+    CHECK(it != graph_.node_map.end())
+        << "Cannot find node " << GetRef<ObjectRef>(key);
+    IndexedGraph::Node* node = it->second;
+    CHECK(node->ref == nullptr);
+    node->ref = key;
+    node->index = graph_.post_dfs_order.size();
+    node->attr = attr;
+    graph_.post_dfs_order.push_back(node);
+    os<<node->attr->type<<" "<<node->index<<"\n";
+  }
+
+  // Post order tree
+  void VisitExpr_(const FunctionNode* op) final {
+    for (auto param : op->params) {
+      this->Update(param, nullptr, kOpaque);
+    }
+    this->Update(op->body, nullptr, kOpaque);
+    ExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitExpr_(const ConstantNode* op) final {
+    Attr* attr = new Attr("constant");
+    for(auto x: op->data.Shape()){
+      attr->shape.push_back(PrimExpr(int(x)));
+    }
+    this->AddNode(op, attr);
+    Node* node = graph_.node_map.at(op);
+    DataType dtype = DataType(op->data->dtype);
+    // This rule must be consistent with code generator.
+    bool is_simple_const = (
+        dtype == DataType::Int(32) ||
+        dtype == DataType::Int(64) ||
+        dtype == DataType::Float(32) ||
+        dtype == DataType::Float(64) ||
+        dtype == DataType::Bool());
+    if (op->is_scalar() && is_simple_const) {
+      node->pattern = kElemWise;
+    } else {
+      // for now, mark non-scalar constant
+      // as opaque, we will not choose to fuse it.
+      node->pattern = kOpaque;
+    }
+  }
+
+  void VisitExpr_(const CallNode* call) final {
+    CHECK(graph_.node_map.count(call));
+    Node* node = graph_.node_map.at(call);
+    static auto fpattern =
+        Op::GetAttr<TOpPattern>("TOpPattern");
+    // Now we set the pattern of this call.
+    //
+    // If we see a call mentioning an operator we should mark it with its
+    // annotated pattern.
+    //
+    // If the pattern is not annotated we will default to opaque.
+    //
+    // Finally if the operator position is not a call node we will
+    // need to call Update, as it may be an arbitrary expression.
+    OpPatternKind op_pattern = kOpaque;
+    if (const OpNode* opnode = call->op.as<OpNode>()) {
+      op_pattern = static_cast<OpPatternKind>(fpattern[GetRef<Op>(opnode)]);
+    } else {
+      this->Update(call->op, node, kOpaque);
+    }
+
+    node->pattern = op_pattern;
+    this->Update(call->op, nullptr, kOpaque);
+    const auto* rtype = call->checked_type().as<TensorTypeNode>();
+    // pass the analysis back to all the children it references.
+    for (size_t i = 0; i < call->args.size(); ++i) {
+      const auto* arg_type =
+          call->args[i]->checked_type().as<TensorTypeNode>();
+      // specifically check if result type is the same as arguments type
+      OpPatternKind edge_pattern = op_pattern;
+      if (edge_pattern == kBroadcast &&
+          arg_type != nullptr &&
+          rtype != nullptr &&
+          attr_equal_(rtype->shape, arg_type->shape)) {
+        edge_pattern = kElemWise;
+      }
+      this->Update(call->args[i], node, edge_pattern);
+    }
+    ExprVisitor::VisitExpr_(call);
+    std::string op_name = "";
+    std::vector<std::string> x{\
+        "nn.conv2d","add","nn.relu","concatenate","nn.max_pool2d","multiply",\
+        "expand_dims","nn.global_avg_pool2d","nn.batch_flatten"};
+    for(auto u:x){
+      if(call->op==Op::Get(u)){
+        op_name = u;
+        break;
+      }
+    }
+    if(op_name==""){
+      os<<call->op<<"\n";
+    }
+    Attr* attr = new Attr(op_name);
+    attr->op_attr = &call->attrs;
+    attr->shape = rtype->shape;
+    this->AddNode(call, attr);
+  }
+
+  void VisitExpr_(const TupleNode* op) final {
+    CHECK(graph_.node_map.count(op));
+    Node* tuple_node = graph_.node_map.at(op);
+    tuple_node->pattern = kTuple;
+    for (const Expr& field : op->fields) {
+      if (field->checked_type().as<TensorTypeNode>()) {
+        this->Update(field, tuple_node, kInjective);
+      } else {
+        this->Update(field, nullptr, kOpaque);
+      }
+    }
+    ExprVisitor::VisitExpr_(op);
+    Attr* attr = new Attr("tuple");
+    this->AddNode(op, attr);
+  }
+
+  void VisitExpr_(const TupleGetItemNode* op) final {
+    auto tuple_type = op->tuple->checked_type().as<TupleTypeNode>();
+    CHECK(tuple_type);
+    // When TVM lowers a fused function, it expects all arguments to be a Tensor or
+    // a tuple containing only Tensors. But this tuple may contain a reference or
+    // another tuple. To avoid modifying codegen logic, we do not allow fusing through this node
+    // if the tuple contains such non Tensor fields. However, all fields will be recursively
+    // visited via call to ExprVisitor::VisitExpr_(op) below and corresponding visitor methods.
+    bool has_non_tensor = false;
+    for (auto ty : tuple_type->fields) {
+      if (!ty.as<TensorTypeNode>()) {
+        has_non_tensor = true;
+        break;
+      }
+    }
+    if (has_non_tensor) {
+      this->Update(op->tuple, nullptr, kOpaque);
+    } else {
+      CHECK(graph_.node_map.count(op));
+      Node* node = graph_.node_map.at(op);
+      node->pattern = kInjective;
+      this->Update(op->tuple, node, kInjective);
+    }
+    ExprVisitor::VisitExpr_(op);
+    Attr* attr = new Attr("getitem");
+    this->AddNode(op, attr);
+  }
+
+  void VisitExpr_(const VarNode* op) final {
+    Attr* attr = new Attr("var");
+    const auto* rtype = op->checked_type().as<TensorTypeNode>();
+    attr->shape = rtype->shape;
+    this->AddNode(op, attr);
+  }
+
+  void VisitExpr_(const LetNode* op) final {
+    // do not fuse through let.
+    this->Update(op->var, nullptr, kOpaque);
+    this->Update(op->value, nullptr, kOpaque);
+    this->Update(op->body, nullptr, kOpaque);
+    ExprVisitor::VisitExpr_(op);
+    Attr* attr = new Attr("let");
+    this->AddNode(op, attr);
+  }
+
+  void VisitExpr_(const IfNode* op) final {
+    // do not fuse through if.
+    this->Update(op->cond, nullptr, kOpaque);
+    this->Update(op->true_branch, nullptr, kOpaque);
+    this->Update(op->false_branch, nullptr, kOpaque);
+    ExprVisitor::VisitExpr_(op);
+    Attr* attr = new Attr("if");
+    this->AddNode(op, attr);
+  }
+
+  void VisitExpr_(const RefCreateNode* op) final {
+    this->Update(op->value, nullptr, kOpaque);
+    ExprVisitor::VisitExpr_(op);
+    Attr* attr = new Attr("refcreate");
+    this->AddNode(op, attr);
+  }
+
+  void VisitExpr_(const RefReadNode* op) final {
+    this->Update(op->ref, nullptr, kOpaque);
+    ExprVisitor::VisitExpr_(op);
+    Attr* attr = new Attr("refread");
+    this->AddNode(op, attr);
+  }
+
+  void VisitExpr_(const RefWriteNode* op) final {
+    this->Update(op->ref, nullptr, kOpaque);
+    this->Update(op->value, nullptr, kOpaque);
+    ExprVisitor::VisitExpr_(op);
+    Attr* attr = new Attr("refwrite");
+    this->AddNode(op, attr);
+  }
+
+  void VisitExpr_(const MatchNode* op) final {
+    this->Update(op->data, nullptr, kOpaque);
+    for (const Clause& c : op->clauses) {
+      this->Update(c->rhs, nullptr, kOpaque);
+    }
+    ExprVisitor::VisitExpr_(op);
+    Attr* attr = new Attr("match");
+    this->AddNode(op, attr);
+  }
+};
+
+IndexedGraph IndexedGraph::Create(
+    support::Arena* arena, const Expr& body) {
+  return Creator(arena).Prepare(body);
+}
+/*
+struct Edge {
+    Node* node{nullptr};
+    OpPatternKind pattern{kOpaque};
+  };
+struct Node {
+    const tvm::Object* ref{nullptr};
+    size_t index{0};
+    bool extern_ref{false};
+    OpPatternKind pattern{kOpaque};
+    LinkedList<Edge> outputs;
+    Attr* attr;
+  };
+*/
+class Partitioner{
+ public:
+  struct Group{
+    std::vector<IndexedGraph::Node*> nodes;
+    IndexedGraph::Node* root;
+    std::vector<IndexedGraph::Node*> nodes_i;
+    std::vector<Group*> parents;
+    std::vector<Group*> children;
+    const Object* root_ref{nullptr};
+    size_t index;
+  };
+  std::vector<Group*> groups;
+  
+  support::Arena* arena_;
+  IndexedGraph::Node* HwSrc;
+  IndexedGraph::Node* HwSrc_t;
+  std::vector<std::pair<IndexedGraph::Node*, IndexedGraph::Node*>> mapped;
+  std::vector<IndexedGraph::Node*> roots;
+  std::unordered_map<std::string, std::vector<std::string>> OpMap = {
+    {"tuple",{"tuple"}},
+    {"concatenate",{"concat"}},
+    
+    {"add",{"pre_adder","post_adder","res_adder"}},
+    {"multiply",{"pre_multiplier","post_multiplier","se_block"}},
+    
+    {"nn.conv2d",{"ipa"}},
+    {"nn.dense",{"ipa"}},
+    
+    {"nn.max_pool2d",{"pool"}},
+    {"nn.avg_pool2d",{"pool"}},
+    {"nn.global_avg_pool2d",{"pool"}},
+    
+    {"nn.relu",{"pre_comparator","post_comparator"}},
+    {"nn.leaky_relu",{"pre_comparator","post_comparator"}}
+  };
+  std::ostringstream os;
+  
+  IndexedGraph::Node* InitNode(std::string op_type, IndexedGraph::Node* src, size_t index){
+    IndexedGraph::Node* node = arena_->make<IndexedGraph::Node>();
+    node->attr = new Attr(op_type);
+    auto* link = arena_->make<LinkNode<IndexedGraph::Edge> >();
+    link->value.node = node;
+    if(src != nullptr){
+      src->outputs.Push(link);
+    }
+    node->index = index;
+    return node;
+  }
+  
+  void InitHwGraph(){
+    IndexedGraph::Node* node = InitNode("tuple", nullptr, 0);
+    IndexedGraph::Node* node0 = InitNode("concat", node, 0);
+    IndexedGraph::Node* node1 = InitNode("pre_adder", node0, 1);
+    IndexedGraph::Node* node2 = InitNode("pre_multiplier", node1, 2);
+    IndexedGraph::Node* node3 = InitNode("pre_comparator", node2, 3);
+    IndexedGraph::Node* node4 = InitNode("ipa", node3, 4);
+    IndexedGraph::Node* node5 = InitNode("post_adder", node4, 5);
+    IndexedGraph::Node* node6 = InitNode("post_multiplier", node5, 6);
+    InitNode("post_comparator", node6, 7);
+    InitNode("pool", node6, 8);
+    InitNode("res_adder", node6, 9);
+    InitNode("upsample", node6, 10);
+    InitNode("se_block", node6, 11);
+    HwSrc = node;
+    HwSrc_t = node6;
+  }
+  
+  void ResetHwGraph(){
+    //siez_t gid = groups.size();
+    Group* group = arena_->make<Group>();
+    std::vector<IndexedGraph::Node*> tmp;
+    for(auto u: mapped){
+      u.first->attr->mapped = false;  
+      u.second->attr->mapped_name = u.first->attr->type;
+      tmp.push_back(u.second);
+    }
+    group->nodes = std::move(tmp);
+    group->root = mapped.back().second;
+    // deal with following nodes in software, e.g. nn.batch_flatten
+    // update group->root
+    while(support::LinkNode<IndexedGraph::Edge>* e = group->root->outputs.head){
+      IndexedGraph::Node* succ = e->value.node;
+      auto it = OpMap.find(succ->attr->type);
+      if(it == OpMap.end()){
+        group->root = succ;
+      } else{
+        break;
+      }
+    }
+    // include constant/expand_dims(constant) into group nodes for completeness
+    roots.push_back(group->root);
+    collectGroupNodes(group->root, group);
+    // make record of groups, clear tmp structure
+    group->index = groups.size();
+    groups.push_back(group);
+    mapped.clear();
+    tmp.clear();
+  }
+  
+  // dfs collect node to group->nodes, terminate when encounter another group root
+  void collectGroupNodes(IndexedGraph::Node* src, Group* group){
+    if(src->attr->type=="var"){
+      group->nodes_i.push_back(src);
+    }
+    auto it = std::find(roots.begin(), roots.end(), src);
+    if(src != group->root && it != roots.end()){
+      return;
+    } else{
+      auto ie = std::find(group->nodes.begin(), group->nodes.end(), src);
+      if(ie == group->nodes.end()){
+        group->nodes.push_back(src);
+      }
+      for(auto* link = src->inputs.head; link != nullptr; link = link->next){
+        collectGroupNodes(link->value.node, group);
+        auto iu = std::find(roots.begin(), roots.end(), link->value.node);
+        if(iu != roots.end()){
+          group->nodes_i.push_back(src);
+        }
+      }  
+    }
+  }
+  
+  void dump(IndexedGraph::Node* node){
+    os << "node[" << node->index << "], "
+         <<node->attr->type
+         << " outputs=[";
+      for (auto* link = node->outputs.head; link != nullptr; link = link->next) {
+        os << link->value.node->index << ", ";
+      }
+    os << "]\n";
+    for (auto* link = node->outputs.head; link != nullptr; link = link->next) {
+        dump(link->value.node);
+      }
+  }
+  
+  IndexedGraph::Node* check(IndexedGraph::Node* ref, IndexedGraph::Node* node){
+    auto it = OpMap.find(node->attr->type);
+    bool match = false;
+    if(it == OpMap.end()){
+      os << "(~)";
+      return ref;
+    } else{
+      std::vector<std::string> keys = it->second;
+      auto itt = std::find(keys.begin(), keys.end(), ref->attr->type);
+      if(itt!=keys.end()){
+        // match to hw unit! update ref as next starting point for hw ref  
+        match = true;
+      }
+    }
+    if(match){
+      std::string op_name = ref->attr->type;
+      if(ref->attr->mapped){
+        os << "\tmatch found but occupied\n";
+        return nullptr;
+      } else{
+        ref->attr->mapped = true;
+        auto p = std::pair<IndexedGraph::Node*, IndexedGraph::Node*>(ref, node);
+        mapped.push_back(p);
+      }
+      if(op_name=="pool" || op_name=="post_comparator" || op_name=="res_adder"){
+        return HwSrc_t;
+      } else{
+        return ref;
+      }
+    } else{
+      for (auto* link = ref->outputs.head; link != nullptr; link = link->next) {
+        IndexedGraph::Node* u = check(link->value.node, node);
+        if(u != nullptr){
+          return u;
+        }
+      }
+      return nullptr;      
+    }   
+  }
+  
+  std::vector<Group*> match(support::Arena* arena, std::vector<IndexedGraph::Node*> graph){
+    os<<"\n\n[Partition]\n";
+    arena_ = arena;
+    // match model graph to hw subgraph
+    this->InitHwGraph();
+    //dump(HwSrc);
+    IndexedGraph::Node* tmp = HwSrc;
+    for (size_t i = 0; i < graph.size(); ++i) {
+      IndexedGraph::Node* node = graph[i];
+      os << "node[" << i << "], "\
+         <<node->attr->type\
+         << " outputs=[";
+      for (auto* link = node->outputs.head; link != nullptr; link = link->next) {
+        os << link->value.node->index << ", ";
+      }
+      os << "]\n";
+      tmp = this->check(tmp, node);
+      if(tmp == nullptr){
+        this->ResetHwGraph();
+        tmp = this->check(HwSrc, node);
+        os << "=======================\n";
+        os << "restart: mapped to "<<tmp->attr->type;
+      } else{
+        os << "\tmapped to "<<tmp->attr->type;
+      }
+      os << "\n";
+    }
+    this->ResetHwGraph();
+    LOG(INFO)<<os.str();
+    return groups;
+  }  
+};
+
+
+class OpFuser: private ExprMutator {
+ public:
+  support::Arena arena_;
+  std::ostringstream os;
+  
+  struct GroupInfo {
+   public:
+    // The parameters of the function.
+    Array<Var> params;
+    // The arguments to call the functions.
+    Array<Expr> arguments;
+    // Get a new parameter or allocate an old one
+    Var GetOrAllocParam(const Expr& expr, const Type& type) {
+      // run linear scan as most fused groups contain only a few inputs.
+      for (size_t i = 0; i < arguments.size(); ++i) {
+        if (expr.same_as(arguments[i])) return params[i];
+      }
+      // create a new parameter.
+      std::ostringstream os;
+      os << "p" << params.size();
+      auto var = VarNode::make(os.str(), type);
+      params.push_back(var);
+      arguments.push_back(expr);
+      return var;
+    }
+    // OPU information
+    OpuInfo* info{nullptr};
+  };
+  std::unordered_map<const Object*, Partitioner::Group*> gmap_;
+  std::unordered_map<Partitioner::Group*, GroupInfo> tginfo_;
+  OpuInfoCollection oic;
+  
+  // Run the transform
+  Expr Transform(const Expr& body) {
+    os << "\n\n[OpFuseHW]\n";
+    // setup the group map.
+    auto graph = IndexedGraph::Create(&arena_, body);
+    // annotate node inputs
+    for (size_t i = 0; i < graph.post_dfs_order.size(); ++i) {
+      IndexedGraph::Node* node = graph.post_dfs_order[i];
+      for (auto* link = node->outputs.head; link != nullptr; link = link->next) {
+        int id_o = link->value.node->index;
+        IndexedGraph::Node* node_o = graph.post_dfs_order[id_o];
+        auto* link_i = arena_.make<LinkNode<IndexedGraph::Edge> >();
+        link_i->value.node = node;
+        node_o->inputs.Push(link_i);
+      }
+    }
+    /*for (size_t i = 0; i < graph.post_dfs_order.size(); ++i) {
+      IndexedGraph::Node* node = graph.post_dfs_order[i];
+      os << "node[" << i << "], "
+         <<node->attr->type
+         << " outputs=[";
+      for (auto* link = node->outputs.head; link != nullptr; link = link->next) {
+        os << link->value.node->index << ", ";
+      }
+      os << "] inputs:[";
+      for (auto* link = node->inputs.head; link != nullptr; link = link->next) {
+        os << link->value.node->index << ", ";
+      }
+      os << "]\n";
+    }*/
+    Partitioner par = Partitioner();
+    std::vector<Partitioner::Group*> groups = par.match(&arena_, graph.post_dfs_order);
+    this->Update(groups);
+    Expr e = this->Mutate(body);
+    LOG(INFO) << os.str();
+    return e;
+  }
+  
+  void Update(std::vector<Partitioner::Group*> groups){
+    for(auto* group: groups){
+      os<<"=======================\n";
+      os<<group<<"\n";
+      os<<"<root>:"<<group->root->index<<"\n";
+      os<<"<input>:"<<group->nodes_i[0]->index<<"\n";
+      for(auto node: group->nodes){
+        os << "node[" << node->index << "], "
+         <<node->attr->type
+         << " outputs=[";
+        for (auto* link = node->outputs.head; link != nullptr; link = link->next) {
+          os << link->value.node->index << ", ";
+        }
+        os << "]\n";
+      }
+    }
+    for(auto* group: groups){
+      for(auto node: group->nodes){
+        gmap_[node->ref] = group;
+      }      
+      group->root_ref = group->root->ref;
+    }
+    
+    for(auto* group: groups){
+      //update inputs/outputs
+      for(support::LinkNode<IndexedGraph::Edge>* e = group->root->outputs.head; e != nullptr; e = e->next){
+        IndexedGraph::Node* node_succ = e->value.node;
+        Partitioner::Group* group_succ = gmap_[node_succ->ref];
+        group->children.push_back(group_succ);
+        group_succ->parents.push_back(group);
+      } 
+    }
+    for(auto* group: groups){
+      OpuInfo* info = arena_.make<OpuInfo>();
+      // group index
+      info->index = group->index;
+      // input/output group index
+      for(auto pred: group->parents){
+        info->input_layer.push_back(pred->index);
+      }
+      for(auto succ: group->children){
+        info->output_layer.push_back(succ->index);
+      }     
+      // group input/output node shape
+      IndexedGraph::Node* node_i = group->nodes_i[0];
+      if(node_i->attr->type == "tuple"){
+        auto* link = node_i->outputs.head;
+        node_i = link->value.node;
+      } 
+      for(auto x : node_i->attr->shape){
+        info->input_size.push_back(OpuInfo::Value(x));
+      }
+      for(auto x : group->root->attr->shape){
+        info->output_size.push_back(OpuInfo::Value(x));
+      }
+      // find node by hardware module name
+      std::unordered_map<std::string, IndexedGraph::Node*> mapped_names;
+      for(auto node: group->nodes){
+        os << node->attr->type <<"->"<< node->attr->mapped_name<<"\n";
+        for(auto sh: node->attr->shape){
+          os << sh <<",";
+        }
+        os << "\n";
+        std::string mn = node->attr->mapped_name;
+        if(mn != ""){
+          mapped_names[mn] = node;
+        }
+      }
+      // type
+      auto ipa_map = mapped_names.find("ipa");
+      bool ipa = !(ipa_map==mapped_names.end());
+      auto pool_map = mapped_names.find("pool");
+      bool pool = !(pool_map==mapped_names.end());
+      auto pre_act_map = mapped_names.find("pre_comparator");
+      auto post_act_map = mapped_names.find("post_comparator");
+      bool act = !(pre_act_map==mapped_names.end() && post_act_map==mapped_names.end());
+      if(!ipa && pool){
+        // single pooling layer, common in inception models
+        info->type = 2;
+      } else if(ipa){
+        // ipa for conv/fc
+        IndexedGraph::Node* node = ipa_map->second;
+        auto* link = node->inputs.head;
+        // weight shape
+        link = link->next;
+        for(auto x : link->value.node->attr->shape){
+          info->ker_size.push_back(OpuInfo::Value(x));
+        }
+        std::string op_name = mapped_names["ipa"]->attr->type;
+        if(op_name=="nn.dense"){
+          info->type = 0;
+        } else if(op_name=="nn.conv2d"){
+          info->type = 1;          
+          auto a = node->attr->op_attr->as<Conv2DAttrs>();
+          for(auto p: a->padding){
+            info->padding_size.push_back(OpuInfo::Value(p));
+          }
+          for(auto p: a->strides){
+            info->ker_stride.push_back(OpuInfo::Value(p));
+          }
+          for(auto p: a->dilation){
+            info->dilation.push_back(OpuInfo::Value(p));
+          }
+          info->data_layout = a->data_layout;
+          info->kernel_layout = a->kernel_layout;
+          info->group = a->groups;
+        }           
+      }
+      // pool
+      if(pool){
+        std::string op_name = mapped_names["pool"]->attr->type;
+        IndexedGraph::Node* node =  pool_map->second;
+        if(op_name=="nn.max_pool2d" || op_name=="nn.avg_pool2d"){
+          if(op_name=="nn.max_pool2d"){
+            info->pooling_type = 1;
+            auto a = node->attr->op_attr->as<MaxPool2DAttrs>();
+            for(auto p: a->padding){
+              info->pool_padding_size.push_back(OpuInfo::Value(p));
+            }
+            for(auto p: a->strides){
+              info->pooling_stride.push_back(OpuInfo::Value(p));
+            }
+            for(auto p: a->pool_size){
+              info->pooling_size.push_back(OpuInfo::Value(p));
+            }
+          } else{
+            info->pooling_type = 2;  
+            auto a = node->attr->op_attr->as<AvgPool2DAttrs>();
+            for(auto p: a->padding){
+              info->pool_padding_size.push_back(OpuInfo::Value(p));
+            }
+            for(auto p: a->strides){
+              info->pooling_stride.push_back(OpuInfo::Value(p));
+            }
+            for(auto p: a->pool_size){
+              info->pooling_size.push_back(OpuInfo::Value(p));
+            }
+          }
+        } else if(op_name=="nn.global_avg_pool2d"){
+          info->pooling_type = 2;    
+          opu_int H = static_cast<opu_int>(info->input_size[2]);
+          for(size_t i=0;i<info->input_size.size()-2;i++){
+            info->pooling_size.push_back(H);
+            info->pooling_stride.push_back(H);
+          }
+        }
+      }
+      // act
+      if(act){
+        std::string op_name = mapped_names["post_comparator"]->attr->type;
+        //IndexedGraph::Node* node =  post_act_map->second;
+        if(op_name=="nn.relu"){
+          info->activation_type = 1;
+        } else if(op_name=="nn.leaky_relu"){
+          info->activation_type = 2;
+        }
+      }
+      oic.Add(info);
+      info->dump(os);
+      os << "======================\n";
+    }
+    oic.dump2file();
+  }
+  
+  
+  // Skip primitive function.
+  Expr VisitExpr_(const FunctionNode* fn_node) {
+    if (fn_node->IsPrimitive()) {
+      return GetRef<Expr>(fn_node);
+    } else {
+      return ExprMutator::VisitExpr_(fn_node);
+    }
+  }
+
+  // Transform calls.
+  Expr VisitExpr_(const CallNode* call) {
+    if (call->op.as<OpNode>()) {
+      static auto fnoncomputational =
+        Op::GetAttr<TNonComputational>("TNonComputational");
+
+      if (fnoncomputational.get(Downcast<Op>(call->op), false)) {
+        return ExprMutator::VisitExpr_(call);
+      }
+      
+      auto* ret_group = gmap_.at(call);
+      Array<Expr> new_args = GetNewArguments(call->args, ret_group);
+
+      auto new_call = CallNode::make(
+          call->op, new_args, call->attrs, call->type_args);
+
+      if (ret_group->root_ref == call) {
+        // This is the root of the group
+        // create the new call node.
+        //os << "GROUP ROOT:" << call << " "<< call->op <<"\n";
+        return MakeNewFunction(ret_group, call->checked_type(), new_call);
+      } else {
+        // This is an intermediate node of a fused function
+        // simply return the new call.
+        return std::move(new_call);
+      }
+    } else {
+      return ExprMutator::VisitExpr_(call);
+    }
+  }
+  
+  Array<Expr> GetNewArguments(const tvm::Array<Expr>& args, Partitioner::Group* current_group) {
+    Array<Expr> new_args;
+    for (auto arg : args) {
+      auto* arg_group = gmap_.at(arg.get());
+      auto type = arg->checked_type();
+      Expr new_arg = this->Mutate(arg);
+      if (current_group != arg_group) {
+        Var param = tginfo_[current_group].GetOrAllocParam(new_arg, type);
+        new_args.push_back(param);
+      } else {
+        new_args.push_back(new_arg);
+      }
+    }
+    return new_args;
+  }
+  
+  Expr MakeNewFunction(Partitioner::Group* group, Type ret_type, Expr body) {
+    // If the function has no call, it is not a primitive function.
+    struct HasCallVisitor : ExprVisitor {
+      bool has_call = false;
+      void VisitExpr_(const CallNode* op) final {
+        has_call = true;
+      }
+    } visitor;
+    visitor(body);
+    const GroupInfo& ginfo = tginfo_[group];
+    auto func = FunctionNode::make(ginfo.params, body, ret_type, {});
+    func = FunctionSetAttr(func, attr::kPrimitive, tvm::Integer(visitor.has_call));
+    return CallNode::make(func, ginfo.arguments, Attrs());
+  }
+  
+  Expr VisitExpr_(const TupleNode* tuple) {
+    auto* ret_group = gmap_.at(tuple);
+    if (ret_group->root_ref == tuple) {
+      return ExprMutator::VisitExpr_(tuple);
+    }
+    // This tuple is an intermediate node in the group
+    Array<Expr> new_fields = GetNewArguments(tuple->fields, ret_group);
+    return TupleNode::make(new_fields);
+  }
+
+  Expr VisitExpr_(const TupleGetItemNode* tuple_get) {
+    auto* ret_group = gmap_.at(tuple_get);
+    auto new_tuple = GetNewArguments({tuple_get->tuple}, ret_group)[0];
+    auto new_node = TupleGetItemNode::make(new_tuple, tuple_get->index);
+    if (ret_group->root_ref == tuple_get) {
+      if (gmap_.at(tuple_get->tuple.get()) != ret_group) {
+        // Isolated. This case occurs when tuple is created by an Opaque op
+        // e.g. multibox_transform_loc
+        return ExprMutator::VisitExpr_(tuple_get);
+      }
+      // A new function whose output is a tuple field access
+      return MakeNewFunction(ret_group, tuple_get->checked_type(), new_node);
+    }
+    // This is an intermediate node in the group
+    return std::move(new_node);
+  }
+};
+
+
+Expr Fuse(const Expr& expr, const IRModule& module) {
+  return OpFuser().Transform(expr);
+}
+
+namespace transform {
+
+Pass FuseOpHW() {
+  runtime::TypedPackedFunc<Function(Function, IRModule, PassContext)> pass_func =
+    [=](Function f, IRModule m, PassContext pc) {
+    return Downcast<Function>(Fuse(f, m));
+  };
+  return CreateFunctionPass(pass_func, 1, "FuseOpHW",
+                            {ir::StringImmNode::make("InferType")});
+}
+
+TVM_REGISTER_GLOBAL("relay._transform.FuseOpHW")
+.set_body_typed(FuseOpHW);
+
+}  // namespace transform
+
+}  // namespace relay
+}  // namespace tvm
