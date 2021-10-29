@@ -31,8 +31,9 @@ sudo docker run --rm --pid=host\
 
 ### Build Compiler
 ```
-cd frontend;mkdir build;cd build;make -j4;cd ../..
-cd data-layout-generator;mkdir build;cd build;make -j4;cd ../..
+cd opu-compiler
+cd frontend;mkdir build;cmake ..;cd build;make -j4;cd ../..
+cd data-layout-generator;mkdir build;cd build;cmake ..;make -j4;cd ../..
 ```
 
 ### Example
