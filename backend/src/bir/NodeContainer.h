@@ -51,14 +51,12 @@ class NodeContainer {
   ListType Elements;
   std::map<std::string, T*> SymbolTable;
 
-  template <typename SUB_OF_T, typename... Args>
-  SUB_OF_T &insertElement(iterator where, const std::string &Name,
-                           Args... ConstructorArgs) {
-    SUB_OF_T *Elt = new SUB_OF_T(Name, static_cast<C*>(this),
-                                 std::forward<Args>(ConstructorArgs)...);                          
-    Elements.insert(where, Elt);
-    SymbolTable.insert({Name, Elt});
-    return *Elt;                             
+  template <typename Type, typename... Args>
+  Type &insertElement(iterator where, const std::string &Name, Args... ConstructorArgs) {
+    Type *element = new Type(Name, static_cast<C*>(this), std::forward<Args>(ConstructorArgs)...);                          
+    Elements.insert(where, element);
+    SymbolTable.insert({Name, element});
+    return *element;                             
   }
 
   NodeContainer & operator=(NodeContainer &&other) {

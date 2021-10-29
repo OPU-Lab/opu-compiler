@@ -2,7 +2,7 @@
 #define BIR_BASICBLOCK_H
 
 #include <unordered_map>
-#include "bir/NamedObjectContainer.h"
+#include "bir/NodeContainer.h"
 #include "bir/Instruction.h"
 #include "nlohmann/json.hpp"
 
@@ -12,11 +12,10 @@ class Function;
 class Instruction;
 class MemoryLocation;
 
-class BasicBlock : public NamedObjectContainer<BasicBlock, Instruction>,
-  public NamedObject<BasicBlock, Function> {
+class BasicBlock : public NodeContainer<BasicBlock, Instruction>,
+  public NodeWithParent<BasicBlock, Function> {
  public:
-  using instruction_iterator = NamedObjectContainer<BasicBlock, Instruction>::iterator;
-  using const_instruction_iterator = NamedObjectContainer<BasicBlock, Instruction>::const_iterator;
+  using instruction_iterator = NodeContainer<BasicBlock, Instruction>::iterator;
   
   BasicBlock(const std::string &Name, Function *Parent);
 
@@ -24,20 +23,16 @@ class BasicBlock : public NamedObjectContainer<BasicBlock, Instruction>,
     return elements();
   }
 
-  inline boost::iterator_range<const_instruction_iterator> instructions() const {
-    return elements();
-  }
-
   template < typename Type, typename... Args>
   Type &insertInstructionBefore(Instruction &where, const std::string Name, Args... ConstructorArgs) {
-    Type &instruction = NamedObjectContainer<BasicBlock, Instruction>::insertElement<Type>(
+    Type &instruction = NodeContainer<BasicBlock, Instruction>::insertElement<Type>(
         where.getIterator(), Name, ConstructorArgs...);
     return instruction;
   }
 
   template < typename Type, typename... Args>
   Type &addInstruction(const std::string Name, Args... ConstructorArgs) {
-    Type &instruction = NamedObjectContainer<BasicBlock, Instruction>::insertElement<Type>(
+    Type &instruction = NodeContainer<BasicBlock, Instruction>::insertElement<Type>(
         end(), Name, ConstructorArgs...
     );
     return instruction;

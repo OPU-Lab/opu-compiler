@@ -4,11 +4,7 @@
 
 using namespace bir;
 
-template<>
-std::atomic<unsigned> NamedObject<Instruction, BasicBlock>::IdCounter(0);
-
-template<>
-std::vector<NamedObject<Instruction, BasicBlock>*> NamedObject<Instruction, BasicBlock>::Id2Obj{};
+template<> std::atomic<unsigned> NodeWithParent<Instruction, BasicBlock>::IdCounter(0);
 
 std::string bir::InstructionType2String(InstructionType ty) {
   std::string name;
@@ -27,7 +23,7 @@ std::string bir::InstructionType2String(InstructionType ty) {
 } 
 
 Instruction::Instruction(const std::string &Name, BasicBlock *Parent, InstructionType Opcode) 
-  : NamedObject<Instruction, BasicBlock>(Name, Parent), Opcode(Opcode) {};
+  : NodeWithParent<Instruction, BasicBlock>(Name, Parent), Opcode(Opcode) {};
 
 
 void Instruction::toJson(nlohmann::json& j) {

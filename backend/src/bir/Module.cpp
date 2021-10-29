@@ -4,7 +4,7 @@
 #include "bir/Function.h"
 #include "bir/BasicBlock.h"
 #include "bir/Instruction.h"
-#include "bir/NamedObjectContainer.h"
+#include "bir/NodeContainer.h"
 
 #include "nlohmann/json.hpp"
 
@@ -13,21 +13,21 @@
 using namespace bir;
 
 Module& Module::operator=(Module &&other) {
-  NamedObjectContainer<Module, Function>::operator=(std::move(other));
+  NodeContainer<Module, Function>::operator=(std::move(other));
   return *this;
 }
 
 Function& Module::addFunction(const std::string &Name) {
-  Function &function = NamedObjectContainer<Module, Function>::insertElement<Function>(end(), Name);
+  Function &function = NodeContainer<Module, Function>::insertElement<Function>(end(), Name);
   return function;  
 }
 
 void Module::removeFunction(Function &Func) {
-  NamedObjectContainer<Module, Function>::removeElement(Func);
+  NodeContainer<Module, Function>::removeElement(Func);
 }
 
 Function* Module::getFunctionByName(const std::string &Name) {
-  return NamedObjectContainer<Module, Function>::getElementByName(Name);
+  return NodeContainer<Module, Function>::getElementByName(Name);
 }
 
 void Module::load(const std::string &inputFileName) {
