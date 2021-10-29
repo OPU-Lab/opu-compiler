@@ -4,14 +4,17 @@
 #include <map>
 #include <boost/range/iterator_range.hpp>
 #include "bir/Function.h"
-#include "bir/NodeContainer.h"
+#include "bir/NamedObjectContainer.h"
 #include "Arch.h"
 
 namespace bir {
 
-class Module : public NodeContainer<Module, Function> {
+class Module : public NamedObjectContainer<Module, Function> {
  public:
   Arch* arch;
+
+  using function_iterator = NamedObjectContainer<Module, Function>::iterator;
+  using const_function_iterator = NamedObjectContainer<Module, Function>::const_iterator;
 
   Module() {
     arch = new Arch();

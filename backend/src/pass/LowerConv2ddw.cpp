@@ -9,15 +9,7 @@
 
 using namespace bir;
 
-float ceil_div(int x, int y) {
-  return ceil((float)x / (float)y);
-}
-
-float floor_div(int x, int y) {
-  return x / y;
-}
-
-void LowerComplex::FindTilingFactorConv2D(bir::Conv2dInst *I, Arch *A, std::unordered_map<std::string, std::vector<int>> &tiling) {
+void LowerComplex::FindTilingFactorConv2DDW(bir::Conv2ddwInst *I, Arch *A, std::unordered_map<std::string, std::vector<int>> &tiling) {
   // Given dataflow, find tiling factors
   int elementsPerDRAMAddr =  A->getElementsPerDRAMAddr();  // 64 for 8-bit
   int simd = A->getSIMDParallelism();
@@ -70,7 +62,7 @@ void LowerComplex::FindTilingFactorConv2D(bir::Conv2dInst *I, Arch *A, std::unor
   std::cout << "tiling size h, w : " << tiling["h"][0] << ", " << tiling["w"][0] << "\n";
 }
 
-void LowerComplex::LowerConv2d(bir::Conv2dInst *I, Arch *A) {
+void LowerComplex::LowerConv2ddw(bir::Conv2ddwInst *I, Arch *A) {
   std::cout << "shape : " << I->h << "," << I->w << "," << I->k << "," << I->c << "," << I->r << "," << I->s << "\n";
   // Build a loopnest
   std::string op_name = I->getName();
@@ -92,7 +84,7 @@ void LowerComplex::LowerConv2d(bir::Conv2dInst *I, Arch *A) {
   loop_s->setUb(I->s);
   
   std::unordered_map<std::string, std::vector<int>> tiling;
-  FindTilingFactorConv2D(I, A, tiling);
+  FindTilingFactorConv2DDW(I, A, tiling);
 
   if (I->getName() == "op_4") {
     //tiling["h"][0] = 26;
@@ -140,13 +132,13 @@ void LowerComplex::LowerConv2d(bir::Conv2dInst *I, Arch *A) {
     //std::cout << loopnest[i]->toString(i) << "\n";  
   }
   loopmap values;
-  LowerConv2dToInstruction(I, loopnest, values, 0);
+  LowerConv2ddwToInstruction(I, loopnest, values, 0);
   //BasicBlock *bb = I->getParent();
   //bb->removeInstruction(*I);
   //bb->dump(std::cout);
 }
 
-void LowerComplex::LowerConv2dToInstruction(Conv2dInst *I, std::vector<LoopAxis*>& loopnest, loopmap& values, int level) {
+void LowerComplex::LowerConv2ddwToInstruction(Conv2ddwInst *I, std::vector<LoopAxis*>& loopnest, loopmap& values, int level) {
   BasicBlock *bb = I->getParent();
   AffineExpr* idx_h = I->getInput(0)->getAccessPattern(2);
   AffineExpr* idx_w = I->getInput(0)->getAccessPattern(3);
@@ -314,6 +306,6 @@ void LowerComplex::LowerConv2dToInstruction(Conv2dInst *I, std::vector<LoopAxis*
   }
   for (int i = loop->lb; i < loop->ub; i += loop->stride) {
     values[loopnest[level]] = i;
-    LowerConv2dToInstruction(I, loopnest, values, level + 1);  
+    LowerConv2ddwToInstruction(I, loopnest, values, level + 1);  
   }
 }

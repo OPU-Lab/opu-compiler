@@ -3,7 +3,7 @@
 
 #include <algorithm>
 
-#include "bir/NodeContainer.h"
+#include "bir/NamedObjectContainer.h"
 #include "bir/LoopAxis.h"
 #include "bir/MemoryLocation.h"
 #include "EngineType.h"
@@ -29,7 +29,7 @@ enum class InstructionType {
 
 std::string InstructionType2String(InstructionType ty);
 
-class Instruction : public NodeWithParent<Instruction, BasicBlock> {
+class Instruction : public NamedObject<Instruction, BasicBlock> {
  public:
   InstructionType Opcode;
   std::vector<Instruction*> pred;
