@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.5)
 project(backend)
 
 find_package(Boost 1.45.0 COMPONENTS range) 
