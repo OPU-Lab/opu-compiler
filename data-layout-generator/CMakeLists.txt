@@ -7,8 +7,8 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -std=c++14")
 
 include_directories(
   ./
-  ../3rdparty/cnpy
-  ../3rdparty/json/single_include
+  ../backend/3rdparty/cnpy
+  ../backend/3rdparty/json/single_include
 )
 
 set(dlg-source
@@ -16,7 +16,7 @@ set(dlg-source
   bias_layout.cpp
   weight_layout.cpp
   utils.cpp
-  ../3rdparty/cnpy/cnpy.cpp
+  ../backend/3rdparty/cnpy/cnpy.cpp
 )
 
 add_executable(data-layout-gen ${dlg-source})
