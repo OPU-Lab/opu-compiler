@@ -33,6 +33,7 @@ sudo docker run --rm --pid=host\
 ```
 cd opu-compiler
 cd frontend;mkdir build;cmake ..;cd build;make -j4;cd ../..
+cd backend;mkdir build;cmake ..;cd build;make -j4;cd ../..
 cd data-layout-generator;mkdir build;cd build;cmake ..;make -j4;cd ../..
 ```
 
@@ -55,7 +56,7 @@ python3 ../../util/run_ir_json.py --config OPU_IR.json --input input.npy --weigh
 Backend performs target-specific code transformations and generate straight line code for simulation.
 ```
 mkdir output # this is where IR will be generated for debugging
-../../backend/backend -i OPU_IR.json --codegen-non-isa
+../../backend/build/backend -i OPU_IR.json --codegen-non-isa
 ```
 data-layout-gen generates weight and bias laytout in DRAM.
 ```
